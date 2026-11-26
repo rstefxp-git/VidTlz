@@ -3,6 +3,7 @@ package nc.marques;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -25,6 +26,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.DocumentsContract;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
@@ -249,7 +251,8 @@ public class MainActivity extends Activity {
             try { getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception e) { }
             openVideo(u, 0, true);
         } else if (req == REQ_ALL) {
-            if (uri == null) pickVideo();
+            if (uri != null) { path = pathOf(uri); loadMarks(); }
+            else pickVideo();
         }
     }
 
@@ -279,6 +282,21 @@ public class MainActivity extends Activity {
         }
     }
 
+    void openAccess() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                startActivityForResult(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName())), REQ_ALL);
+            } catch (Exception e) {
+                try { startActivityForResult(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION), REQ_ALL); }
+                catch (Exception e2) { toast("Réglage introuvable"); }
+            }
+        } else {
+            requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_PERM);
+        }
+    }
+
     void pickVideo() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -301,6 +319,24 @@ public class MainActivity extends Activity {
                 }
                 if ("com.android.providers.downloads.documents".equals(auth) && id.startsWith("raw:"))
                     return id.substring(4);
+                if ("com.android.providers.media.documents".equals(auth)) {
+                    String[] p = id.split(":", 2);
+                    if (p.length == 2) {
+                        String d = dataOf(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Long.parseLong(p[1])));
+                        if (d != null) return d;
+                    }
+                }
+            }
+            return dataOf(u);
+        } catch (Exception e) { }
+        return null;
+    }
+
+    String dataOf(Uri u) {
+        try (Cursor c = getContentResolver().query(u, new String[]{"_data"}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                String d = c.getString(0);
+                if (d != null && d.startsWith("/")) return d;
             }
         } catch (Exception e) { }
         return null;
@@ -553,28 +589,65 @@ public class MainActivity extends Activity {
     void flash(String s) { flash = s; flashUntil = System.currentTimeMillis() + 2000; }
 
     // ---------------------------------------------------------------- images
-    boolean grab(MediaMetadataRetriever r, long ms, File dir) {
-        try {
-            dir.mkdirs();
-            Bitmap b = r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST);
-            if (b == null) return false;
-            File f = new File(dir, base + "_" + fmt(ms).replace(':', '-').replace('.', '_') + ".png");
-            try (FileOutputStream o = new FileOutputStream(f)) { b.compress(Bitmap.CompressFormat.PNG, 100, o); }
-            return true;
-        } catch (Exception e) { return false; }
+    volatile String lastErr = "";
+    volatile File lastDir;
+
+    File appDir() {
+        File d = getExternalFilesDir(null);
+        return d != null ? d : getFilesDir();
+    }
+
+    String outPath() { return lastDir == null ? "" : lastDir.getAbsolutePath(); }
+
+    MediaMetadataRetriever retr() {
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try { if (path != null && new File(path).canRead()) { r.setDataSource(path); return r; } } catch (Exception e) { }
+        try { r.setDataSource(this, uri); return r; }
+        catch (Exception e) { lastErr = "lecture impossible : " + e.getMessage(); }
+        try { r.release(); } catch (Exception e) { }
+        return null;
+    }
+
+    boolean grab(MediaMetadataRetriever r, long ms, File dir, Bitmap fb) {
+        Bitmap b = null;
+        if (r != null) {
+            try { b = r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST); }
+            catch (Exception e) { lastErr = String.valueOf(e.getMessage()); }
+            if (b == null) {
+                try { b = r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC); } catch (Exception e) { }
+            }
+        }
+        if (b == null) b = fb;
+        if (b == null) { lastErr = "image non décodée"; return false; }
+        String fn = base + "_" + fmt(ms).replace(':', '-').replace('.', '_') + ".png";
+        File[] ds = {dir, new File(appDir(), base + "_img")};
+        for (File d : ds) {
+            try {
+                if (!d.isDirectory() && !d.mkdirs()) { lastErr = "dossier non créé : " + d; continue; }
+                boolean okc;
+                try (FileOutputStream o = new FileOutputStream(new File(d, fn))) {
+                    okc = b.compress(Bitmap.CompressFormat.PNG, 100, o);
+                }
+                if (!okc) { lastErr = "compression PNG"; continue; }
+                lastDir = d;
+                return true;
+            } catch (Exception e) { lastErr = String.valueOf(e.getMessage()); }
+        }
+        return false;
     }
 
     void saveFrame() {
         if (!ready || !begin("Image")) return;
         final long ms = Math.round(curPos());
         final File dir = new File(videoDir(), base + "_img");
+        Bitmap s0 = null;
+        try { if (tv.isAvailable()) s0 = tv.getBitmap(); } catch (Exception e) { }
+        final Bitmap snap = s0;
         new Thread(() -> {
-            MediaMetadataRetriever r = new MediaMetadataRetriever();
-            boolean ok = false;
-            try { r.setDataSource(this, uri); ok = grab(r, ms, dir); } catch (Exception e) { }
-            try { r.release(); } catch (Exception e) { }
-            final boolean fo = ok;
-            runOnUiThread(() -> endWork(fo ? "✔ 1/1 → " + dir.getName() : "échec"));
+            MediaMetadataRetriever r = retr();
+            final boolean ok = grab(r, ms, dir, snap);
+            try { if (r != null) r.release(); } catch (Exception e) { }
+            runOnUiThread(() -> endWork(ok ? "✔ 1/1 → " + outPath() : "échec : " + lastErr));
         }).start();
     }
 
@@ -585,23 +658,26 @@ public class MainActivity extends Activity {
         final Long[] ms = marks.toArray(new Long[0]);
         final File dir = new File(videoDir(), base + "_img");
         new Thread(() -> {
-            MediaMetadataRetriever r = new MediaMetadataRetriever();
+            MediaMetadataRetriever r = retr();
             int okc = 0;
-            try { r.setDataSource(this, uri); } catch (Exception e) { }
             for (int i = 0; i < ms.length && !cancel; i++) {
                 final int n = i + 1;
                 runOnUiThread(() -> setInfo(n + " / " + ms.length));
-                if (grab(r, ms[i], dir)) okc++;
+                if (grab(r, ms[i], dir, null)) okc++;
             }
-            try { r.release(); } catch (Exception e) { }
+            try { if (r != null) r.release(); } catch (Exception e) { }
             final int fo = okc;
-            runOnUiThread(() -> endWork((cancel ? "annulé " : "✔ ") + fo + "/" + ms.length + " → " + dir.getName()));
+            runOnUiThread(() -> endWork((cancel ? "annulé " : "✔ ") + fo + "/" + ms.length
+                    + (fo < ms.length ? " (" + lastErr + ")" : "") + " → " + outPath()));
         }).start();
     }
 
     // ---------------------------------------------------------------- témoin de travail
     boolean begin(String label) {
         if (workOn) { toast("Action en cours"); return false; }
+        lastErr = "";
+        lastDir = null;
+        if (!hasAll()) toast("Accès fichiers absent : sortie dans le dossier de l'appli (⚙ → Accès fichiers)");
         workLabel = label;
         workInfo = "";
         workT0 = SystemClock.elapsedRealtime();
@@ -645,6 +721,7 @@ public class MainActivity extends Activity {
         FFmpegKit.executeWithArgumentsAsync(a,
                 ses -> {
                     final boolean ok = ReturnCode.isSuccess(ses.getReturnCode());
+                    lastErr = ok ? "" : tail(ses.getOutput());
                     runOnUiThread(() -> d.d(ok));
                 },
                 lg -> { },
@@ -658,7 +735,17 @@ public class MainActivity extends Activity {
         return dur > 0 ? Math.min(99, (int) (s.getTime() * 100.0 / dur)) + "%" : "";
     }
 
-    String res(boolean ok, String good) { return cancel ? "annulé" : ok ? good : "échec"; }
+    String res(boolean ok, String good) { return cancel ? "annulé" : ok ? good : "échec : " + lastErr; }
+
+    static String tail(String o) {
+        if (o == null) return "";
+        String[] L = o.split("\\n");
+        for (int i = L.length - 1; i >= 0; i--) {
+            String t = L[i].trim();
+            if (!t.isEmpty()) return t.length() > 140 ? t.substring(t.length() - 140) : t;
+        }
+        return "";
+    }
 
     // --- Extracteur
     void extractor() {
@@ -682,7 +769,7 @@ public class MainActivity extends Activity {
 
     void nextStream(final String inp, final File dir, final List<StreamInformation> L, final int k, final int okc) {
         if (cancel || k >= L.size()) {
-            endWork((cancel ? "annulé " : "✔ ") + okc + "/" + L.size() + " flux → " + dir.getName());
+            endWork((cancel ? "annulé " : "✔ ") + okc + "/" + L.size() + " flux → " + dir.getAbsolutePath());
             return;
         }
         StreamInformation s = L.get(k);
@@ -762,7 +849,7 @@ public class MainActivity extends Activity {
         run(a, st -> st.getVideoFrameNumber() + " / ≈" + est + "  " + pct(st),
                 ok -> {
                     String[] l = dir.list();
-                    endWork(res(ok, "✔ " + (l == null ? 0 : l.length) + " images → " + dir.getName()));
+                    endWork(res(ok, "✔ " + (l == null ? 0 : l.length) + " images → " + dir.getAbsolutePath()));
                 });
     }
 
@@ -790,7 +877,7 @@ public class MainActivity extends Activity {
         final int n = m.length;
         setInfo(n + " chapitres");
         run(a, st -> n + " chapitres  " + pct(st),
-                ok -> endWork(res(ok, "✔ " + n + " chapitres → " + out.getName())));
+                ok -> endWork(res(ok, "✔ " + n + " chapitres → " + out.getAbsolutePath())));
     }
 
     // ---------------------------------------------------------------- menu
@@ -801,7 +888,8 @@ public class MainActivity extends Activity {
                         "Extracteur (flux du fichier)",
                         "All frames → sous-dossier",
                         "Marques → chapitres",
-                        "Marques → images PNG"},
+                        "Marques → images PNG",
+                        "Accès fichiers : " + (hasAll() ? "OK" : "NON — régler")},
                         (d, w) -> {
                             switch (w) {
                                 case 0: pickVideo(); break;
@@ -809,6 +897,7 @@ public class MainActivity extends Activity {
                                 case 2: frames(); break;
                                 case 3: chapters(); break;
                                 case 4: exportMarks(); break;
+                                case 5: openAccess(); break;
                             }
                         })
                 .show();
