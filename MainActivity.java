@@ -797,7 +797,7 @@ public class MainActivity extends Activity {
                 case "subrip": case "srt": ext = "srt"; break;
                 case "ass": case "ssa": ext = "ass"; break;
                 case "mov_text": case "webvtt": case "text":
-                    ext = "srt"; cc.clear(); cc.add("-c:s"); cc.add("srt"); break;
+                    ext = "mks"; break;
                 case "hdmv_pgs_subtitle": ext = "sup"; break;
                 default: ext = "mks";
             }
@@ -836,21 +836,55 @@ public class MainActivity extends Activity {
                 .setNegativeButton("Annuler", null).show();
     }
 
+    /** Extraction native (MediaMetadataRetriever) : le build ffmpeg n'a pas d'encodeur PNG/JPEG. */
     void doFrames(final double f) {
         if (!ready || !begin("All frames")) return;
-        final File dir = new File(videoDir(), base + "_frames");
-        dir.mkdirs();
-        final long est = Math.round(dur / 1000.0 * (f > 0 ? f : fps));
-        String outp = new File(dir, "f_%06d.png").getAbsolutePath();
-        String[] a = f > 0
-                ? new String[]{"-y", "-i", in(), "-map", "0:v:0", "-an", "-sn", "-vf", "fps=" + f, outp}
-                : new String[]{"-y", "-i", in(), "-map", "0:v:0", "-an", "-sn", "-fps_mode", "passthrough", outp};
-        setInfo("0 / ≈" + est);
-        run(a, st -> st.getVideoFrameNumber() + " / ≈" + est + "  " + pct(st),
-                ok -> {
-                    String[] l = dir.list();
-                    endWork(res(ok, "✔ " + (l == null ? 0 : l.length) + " images → " + dir.getAbsolutePath()));
-                });
+        final double rate = f > 0 ? f : fps;
+        final long durMs = dur;
+        final File want = new File(videoDir(), base + "_frames");
+        new Thread(() -> {
+            MediaMetadataRetriever r = retr();
+            if (r == null) { runOnUiThread(() -> endWork("échec : " + lastErr)); return; }
+            File d = want;
+            if (!d.isDirectory() && !d.mkdirs()) d = new File(appDir(), base + "_frames");
+            d.mkdirs();
+            lastDir = d;
+            boolean byIndex = f <= 0 && Build.VERSION.SDK_INT >= 28;
+            long total = Math.round(durMs / 1000.0 * rate);
+            if (byIndex) {
+                try {
+                    int c = Integer.parseInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT));
+                    if (c > 0) total = c; else byIndex = false;
+                } catch (Exception e) { byIndex = false; }
+            }
+            final long tot = total;
+            int okc = 0;
+            long lastUi = 0;
+            for (int i = 0; i < tot && !cancel; i++) {
+                Bitmap b = null;
+                try {
+                    b = byIndex ? r.getFrameAtIndex(i)
+                            : r.getFrameAtTime(Math.round(i * 1e6 / rate), MediaMetadataRetriever.OPTION_CLOSEST);
+                } catch (Exception e) { lastErr = String.valueOf(e.getMessage()); }
+                if (b != null) {
+                    try (FileOutputStream o = new FileOutputStream(new File(d, String.format(Locale.US, "f_%06d.png", i + 1)))) {
+                        if (b.compress(Bitmap.CompressFormat.PNG, 100, o)) okc++;
+                    } catch (Exception e) { lastErr = String.valueOf(e.getMessage()); }
+                    b.recycle();
+                }
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastUi > 120) {
+                    lastUi = now;
+                    final String t = (i + 1) + " / " + tot + "  " + (tot > 0 ? (i + 1) * 100 / tot : 0) + "%";
+                    runOnUiThread(() -> setInfo(t));
+                }
+            }
+            try { r.release(); } catch (Exception e) { }
+            final int fo = okc;
+            final String where = d.getAbsolutePath();
+            runOnUiThread(() -> endWork(cancel ? "annulé " + fo + " images → " + where
+                    : fo > 0 ? "✔ " + fo + "/" + tot + " images → " + where : "échec : " + lastErr));
+        }).start();
     }
 
     // --- Marques → chapitres
