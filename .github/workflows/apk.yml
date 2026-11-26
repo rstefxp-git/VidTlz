@@ -1,0 +1,98 @@
+name: apk
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Projet
+        run: |
+          P=build_apk
+          rm -rf $P
+          mkdir -p $P/app/src/main/java/nc/marques
+          cp MainActivity.java $P/app/src/main/java/nc/marques/MainActivity.java
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          cat > $P/settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'lecteur-marques'
+          include ':app'
+          EOF
+          cat > $P/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > $P/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'nc.marques'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'nc.marques'
+              minSdk 26
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+              ndk { abiFilters 'arm64-v8a' }
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            packaging { jniLibs { useLegacyPackaging = true } }
+          }
+          dependencies {
+            implementation 'dev.ffmpegkit-maintained:ffmpeg:7.1.6'
+          }
+          EOF
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+            <application android:label="Lecteur marques" android:requestLegacyExternalStorage="true">
+              <activity android:name="nc.marques.MainActivity"
+                android:exported="true"
+                android:launchMode="singleTask"
+                android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|uiMode|density">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+                <intent-filter>
+                  <action android:name="android.intent.action.VIEW"/>
+                  <category android:name="android.intent.category.DEFAULT"/>
+                  <category android:name="android.intent.category.BROWSABLE"/>
+                  <data android:mimeType="video/*"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+      - name: Build
+        working-directory: build_apk
+        run: gradle assembleDebug --no-daemon
+      - name: Renommer
+        run: cp build_apk/app/build/outputs/apk/debug/app-debug.apk Lecteur_marques.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lecteur_marques
+          path: Lecteur_marques.apk
